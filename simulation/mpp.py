@@ -177,6 +177,8 @@ def simulate_timeseries(
     out["P_lineal_ref"] = stc.p_nom * out["G"] / G_REF * n_mod
 
     out.attrs["n_modules"] = n_mod
+    out.attrs["n_series"] = int(n_series)
+    out.attrs["n_parallel"] = int(n_parallel)
     out.attrs["p_nom_array_W"] = stc.p_nom * n_mod
     out.attrs["area_array_m2"] = stc.area * n_mod
     out.attrs["noct"] = noct
