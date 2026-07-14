@@ -514,7 +514,6 @@ with tab3:
                 )
                 bar.empty()
                 st.session_state["results"] = res
-                st.session_state["kpis"] = compute_kpis(res, module, infer_timestep_hours(res))
                 st.success(
                     f"Simulación completada: {len(res)} puntos de operación resueltos. "
                     "Los resultados están en la pestaña 4."
@@ -526,8 +525,13 @@ with tab3:
 # ===========================================================================
 with tab4:
     res = st.session_state["results"]
-    kpi = st.session_state["kpis"]
     module = st.session_state["module"]
+
+    # kpi se recalcula siempre a partir de `res` (no se reutiliza el dict cacheado
+    # en session_state): así, si el código de compute_kpis cambia entre versiones,
+    # una sesión de navegador ya abierta no se rompe con un KeyError por un dict
+    # de KPIs viejo que no tiene las claves nuevas.
+    kpi = compute_kpis(res, module, infer_timestep_hours(res)) if res is not None else None
 
     if res is None or kpi is None:
         st.info("Ejecutá una simulación en la pestaña 3 para ver los resultados.")
