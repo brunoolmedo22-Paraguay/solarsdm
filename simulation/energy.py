@@ -42,6 +42,8 @@ def compute_kpis(results: pd.DataFrame, module, dt_hours: float | None = None) -
     dt = infer_timestep_hours(results) if dt_hours is None else float(dt_hours)
 
     n_mod = results.attrs.get("n_modules", 1)
+    n_series = results.attrs.get("n_series", n_mod)
+    n_parallel = results.attrs.get("n_parallel", 1)
     p_nom_kw = results.attrs.get("p_nom_array_W", stc.p_nom * n_mod) / 1000.0
     area = results.attrs.get("area_array_m2", stc.area * n_mod)
 
@@ -103,7 +105,10 @@ def compute_kpis(results: pd.DataFrame, module, dt_hours: float | None = None) -
         "E_lineal_ref_kWh": e_lineal_kwh,
         "p_nom_kWp": p_nom_kw,
         "area_m2": area,
+        "area_module_m2": stc.area,
         "n_modules": n_mod,
+        "n_series": n_series,
+        "n_parallel": n_parallel,
         "dt_hours": dt,
     }
 
