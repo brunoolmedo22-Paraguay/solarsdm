@@ -286,6 +286,7 @@ with tab1:
             plot_iv_pv([{"label": "STC", "V": V, "I": I, "P": P, "mpp": mpp_stc}],
                        "· condiciones STC"),
             width="stretch",
+            key="chart_iv_pv_stc",
         )
 
 
@@ -411,8 +412,8 @@ with tab2:
         p3.metric("T amb. máxima", f"{df['Tamb'].max():.1f} °C")
         p4.metric("T célula máxima", f"{df['Tc'].max():.1f} °C")
 
-        st.plotly_chart(plot_irradiance(df), width="stretch")
-        st.plotly_chart(plot_temperatures(df), width="stretch")
+        st.plotly_chart(plot_irradiance(df), width="stretch", key="chart_irr_preview")
+        st.plotly_chart(plot_temperatures(df), width="stretch", key="chart_temp_preview")
     else:
         st.info("Generá un perfil sintético o cargá un CSV para continuar.")
 
@@ -561,15 +562,15 @@ with tab4:
 
         # ------------------------- Series temporales ----------------------
         st.subheader("Series temporales")
-        st.plotly_chart(plot_irradiance(res), width="stretch")
-        st.plotly_chart(plot_temperatures(res), width="stretch")
+        st.plotly_chart(plot_irradiance(res), width="stretch", key="chart_irr_results")
+        st.plotly_chart(plot_temperatures(res), width="stretch", key="chart_temp_results")
 
         show_ref = st.checkbox(
             "Superponer la referencia lineal P = Pnom·G/1000 (solo comparación)", value=False,
             help="El simulador NO usa esta expresión. Se muestra únicamente para "
                  "cuantificar el error de esa aproximación frente al SDM.",
         )
-        st.plotly_chart(plot_power(res, show_linear_ref=show_ref), width="stretch")
+        st.plotly_chart(plot_power(res, show_linear_ref=show_ref), width="stretch", key="chart_power")
 
         if show_ref:
             err = (kpi["E_lineal_ref_kWh"] - kpi["E_day_kWh"]) / kpi["E_day_kWh"] * 100
@@ -579,8 +580,8 @@ with tab4:
                 "(ignora el derating térmico y las pérdidas resistivas)."
             )
 
-        st.plotly_chart(plot_efficiency(res, module.stc.efficiency_stc), width="stretch")
-        st.plotly_chart(plot_energy(res, dt_h), width="stretch")
+        st.plotly_chart(plot_efficiency(res, module.stc.efficiency_stc), width="stretch", key="chart_efficiency")
+        st.plotly_chart(plot_energy(res, dt_h), width="stretch", key="chart_energy")
 
         st.divider()
 
@@ -616,7 +617,7 @@ with tab4:
         curves.append({"label": "STC (referencia)", "V": Vs, "I": Is, "P": Ps,
                        "mpp": find_mpp(p_stc), "color": "#9AA5B1"})
 
-        st.plotly_chart(plot_iv_pv(curves), width="stretch")
+        st.plotly_chart(plot_iv_pv(curves), width="stretch", key="chart_iv_pv_instant")
 
         # --- Familias de curvas (validación física visual) -----------------
         with st.expander("Familias de curvas I-V (validación física del modelo)"):
@@ -631,6 +632,7 @@ with tab4:
                     plot_iv_family(fam_g, "Tensión V [V]",
                                    "Efecto de la irradiancia (Tc = 25 °C) — la corriente escala con G"),
                     width="stretch",
+                    key="chart_family_irr",
                 )
             with fam2:
                 fam_t = {}
@@ -642,9 +644,10 @@ with tab4:
                     plot_iv_family(fam_t, "Tensión V [V]",
                                    "Efecto de la temperatura (G = 1000 W/m²) — Voc cae con Tc"),
                     width="stretch",
+                    key="chart_family_temp",
                 )
 
-        st.plotly_chart(plot_mpp_trajectory(res), width="stretch")
+        st.plotly_chart(plot_mpp_trajectory(res), width="stretch", key="chart_mpp_traj")
 
         st.divider()
 
