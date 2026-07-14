@@ -562,15 +562,19 @@ with tab4:
         k12.metric("Tc máxima", f"{kpi['Tc_max_C']:.1f} °C",
                    delta=f"{kpi['Tc_mean_sun_C']:.1f} °C media (con sol)")
 
+        n_series_v = kpi.get("n_series", kpi.get("n_modules", 1))
+        n_parallel_v = kpi.get("n_parallel", 1)
+        area_mod_v = kpi.get("area_module_m2", module.stc.area)
+
         k13, k14, k15, k16 = st.columns(4)
         k13.metric("Configuración del array",
-                    f"{kpi['n_series']} serie × {kpi['n_parallel']} paralelo",
+                    f"{n_series_v} serie × {n_parallel_v} paralelo",
                     help="Definida en la pestaña 3 · Simulación.")
         k14.metric("Módulos totales", f"{kpi['n_modules']}")
         k15.metric("Potencia nominal del array", f"{kpi['p_nom_kWp']*1000:.0f} Wp",
                     help=f"{kpi['n_modules']} × {module.stc.p_nom:.0f} Wp (1 módulo)")
         k16.metric("Área total del array", f"{kpi['area_m2']:.2f} m²",
-                    help=f"{kpi['n_modules']} × {kpi['area_module_m2']:.3f} m² (1 módulo: "
+                    help=f"{kpi['n_modules']} × {area_mod_v:.3f} m² (1 módulo: "
                          f"{module.stc.length:.3f} × {module.stc.width:.3f} m)")
 
         st.divider()
