@@ -77,6 +77,13 @@ from models.pv_module import PVModule, SDMParams
 from models.single_diode import iv_curve
 from models.temperature_model import cell_temperature_noct
 from simulation.energy import compute_kpis
+from simulation.export import (
+    DEFAULT_EXPORT_COLUMNS,
+    available_export_columns,
+    build_export_dataframe,
+    normalize_csv_filename,
+    slice_results_interval,
+)
 from simulation.mpp import find_mpp, simulate_timeseries
 from simulation.solver import extract_sdm_params, translate_params
 from visualization.plots import (
@@ -199,11 +206,12 @@ st.caption(
     "completa del circuito equivalente de un diodo. Sin aproximaciones lineales de potencia."
 )
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1 · Configuración del panel",
     "2 · Irradiancia y temperatura",
     "3 · Modelo y simulación",
     "4 · Resultados",
+    "5 · Exportar resultados",
 ])
 
 
@@ -747,7 +755,7 @@ with tab3:
                 st.session_state["results"] = res
                 st.success(
                     f"Simulación completada: {len(res)} puntos de operación resueltos. "
-                    "Los resultados están en la pestaña 4."
+                    "Os resultados estão na aba 4 e a exportação para o otimizador na aba 5."
                 )
 
 
@@ -768,7 +776,6 @@ with tab4:
             st.warning("O intervalo selecionado não contém resultados.")
         else:
             kpi = compute_kpis(res_view, module, infer_timestep_hours(res_view))
-            kpi_full = compute_kpis(res, module, infer_timestep_hours(res))
             dt_h = kpi["dt_hours"]
             st.caption(
                 f"Indicadores e gráficos calculados para **{results_period_label}** · "
@@ -920,34 +927,203 @@ with tab4:
             st.plotly_chart(plot_mpp_trajectory(res_view), width="stretch", key="chart_mpp_traj")
 
             st.divider()
-
-            # ------------------------- Downloads ------------------------------
-            st.subheader("Exportação")
-            st.caption("Os arquivos abaixo correspondem à simulação completa, não apenas ao recorte exibido.")
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    "⬇️ Série temporal simulada (CSV)",
-                    res.to_csv().encode("utf-8"),
-                    file_name="pv_simulacao_series.csv",
-                    mime="text/csv",
-                    width="stretch",
-                )
-            with d2:
-                kpi_out = {
-                    k: (v.strftime("%Y-%m-%d %H:%M") if hasattr(v, "strftime") else v)
-                    for k, v in kpi_full.items()
-                }
-                st.download_button(
-                    "⬇️ KPIs da simulação completa (CSV)",
-                    pd.Series(kpi_out, name="valor").to_csv().encode("utf-8"),
-                    file_name="pv_simulacao_kpis.csv",
-                    mime="text/csv",
-                    width="stretch",
-                )
+            st.info(
+                "A exportação compacta para o otimizador está na aba "
+                "**5 · Exportar resultados**. Nela é possível selecionar dia, "
+                "horário inicial, duração e colunas do CSV."
+            )
 
             with st.expander("Tabela de resultados do intervalo exibido (primeiras 200 linhas)"):
                 st.dataframe(res_view.head(200), width="stretch")
+
+
+# ===========================================================================
+# TAB 5 — EXPORTAR RESULTADOS
+# ===========================================================================
+with tab5:
+    res = st.session_state["results"]
+    module = st.session_state["module"]
+
+    if res is None or module is None:
+        st.info("Execute uma simulação na aba 3 antes de preparar o CSV para o otimizador.")
+    else:
+        st.subheader("Selecionar janela de exportação")
+        st.caption(
+            "O intervalo usa o padrão **[início, fim)**. Em uma série de 1 minuto, "
+            "uma duração de 120 minutos gera exatamente 120 linhas."
+        )
+
+        all_dates = sorted(set(res.index.date))
+        s1, s2 = st.columns([1.2, 1.0])
+        with s1:
+            export_day = st.selectbox(
+                "Dia",
+                options=all_dates,
+                index=0,
+                format_func=lambda d: d.isoformat(),
+                key="export_day",
+            )
+
+        day_start = pd.Timestamp(export_day)
+        day_end = day_start + pd.Timedelta(days=1)
+        day_rows = res.loc[(res.index >= day_start) & (res.index < day_end)].copy()
+        day_rows.attrs = dict(res.attrs)
+
+        dt_full_h = infer_timestep_hours(res)
+        dt_minutes = max(dt_full_h * 60.0, 1e-9)
+        max_duration = max(
+            1,
+            int(np.floor((day_end - day_rows.index.min()).total_seconds() / 60.0))
+            if not day_rows.empty else 1,
+        )
+        default_duration = min(120, max_duration)
+
+        with s2:
+            duration_minutes = st.number_input(
+                "Duração do intervalo [min]",
+                min_value=1,
+                max_value=max_duration,
+                value=default_duration,
+                step=1,
+                key=f"export_duration_minutes_{export_day.isoformat()}",
+                help="Padrão do fluxo: 120 minutos.",
+            )
+
+        if day_rows.empty:
+            st.warning("O dia selecionado não contém resultados.")
+        else:
+            latest_valid_start = day_end - pd.Timedelta(minutes=int(duration_minutes))
+            start_options = day_rows.index[day_rows.index <= latest_valid_start].tolist()
+            if not start_options:
+                start_options = [day_rows.index[0]]
+
+            positive_rows = day_rows.loc[day_rows.get("P_array", 0) > 0]
+            default_start = positive_rows.index[0] if not positive_rows.empty else start_options[0]
+            default_start_index = (
+                start_options.index(default_start) if default_start in start_options else 0
+            )
+
+            start_key = f"export_start_{export_day.isoformat()}_{int(duration_minutes)}"
+            export_start = st.selectbox(
+                "Início do intervalo",
+                options=start_options,
+                index=default_start_index,
+                format_func=lambda ts: ts.strftime("%H:%M:%S"),
+                key=start_key,
+            )
+
+            export_window, window_start, window_end = slice_results_interval(
+                res,
+                selected_day=export_day,
+                start_value=export_start,
+                duration_minutes=int(duration_minutes),
+            )
+
+            expected_rows = max(1, int(round(int(duration_minutes) / dt_minutes)))
+            st.markdown(
+                f"**Janela selecionada:** `{window_start:%Y-%m-%d %H:%M:%S}` até "
+                f"`{window_end:%Y-%m-%d %H:%M:%S}` · "
+                f"**{len(export_window):,} linhas**"
+            )
+            if len(export_window) != expected_rows:
+                st.warning(
+                    f"Para um passo estimado de {dt_minutes:g} min, eram esperadas "
+                    f"aproximadamente {expected_rows} linhas, mas o intervalo contém "
+                    f"{len(export_window)}. Verifique lacunas ou irregularidades temporais."
+                )
+
+            if export_window.empty:
+                st.warning("O intervalo escolhido não contém resultados para exportar.")
+            else:
+                interval_kpis = compute_kpis(export_window, module, dt_full_h)
+
+                st.subheader("KPIs do intervalo")
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("Energia gerada", f"{interval_kpis['E_period_kWh']:.4f} kWh")
+                q2.metric("Potência máxima", f"{interval_kpis['P_max_W']:.2f} W")
+                q3.metric("Potência média", f"{interval_kpis['P_mean_W']:.2f} W")
+                q4.metric("Eficiência média", f"{interval_kpis['eta_mean']*100:.2f} %")
+
+                q5, q6, q7, q8 = st.columns(4)
+                q5.metric("Irradiação", f"{interval_kpis['H_period_kWh_m2']:.4f} kWh/m²")
+                q6.metric("Tc máxima", f"{interval_kpis['Tc_max_C']:.2f} °C")
+                q7.metric(
+                    "Instante do pico",
+                    interval_kpis["t_peak"].strftime("%H:%M:%S")
+                    if interval_kpis["t_peak"] is not None else "—",
+                )
+                q8.metric(
+                    "Linhas / passo",
+                    f"{len(export_window)} / {dt_minutes:g} min",
+                    help=f"Duração efetiva integrada: {interval_kpis['duration_h']*60:.1f} min.",
+                )
+
+                st.subheader("Tabela do intervalo")
+                interval_table = pd.DataFrame({
+                    "timestamp": export_window.index.strftime("%Y-%m-%d %H:%M:%S"),
+                    "ghi_W_m2": export_window["G"].to_numpy(),
+                    "temperatura_ambiente_C": export_window["Tamb"].to_numpy(),
+                    "temperatura_celula_C": export_window["Tc"].to_numpy(),
+                    "potencia_gerada_W": export_window["P_array"].to_numpy(),
+                    "energia_passo_Wh": export_window["P_array"].to_numpy() * dt_full_h,
+                    "eficiencia_pct": export_window["eta"].to_numpy() * 100.0,
+                })
+                st.dataframe(interval_table, width="stretch", height=430)
+
+                st.divider()
+                st.subheader("Configurar colunas do CSV")
+                available_columns = available_export_columns(export_window)
+                default_columns = [
+                    label for label in DEFAULT_EXPORT_COLUMNS if label in available_columns
+                ]
+                selected_columns = st.multiselect(
+                    "Colunas incluídas",
+                    options=available_columns,
+                    default=default_columns,
+                    key="export_selected_columns",
+                    help=(
+                        "O padrão contém somente timestamp e potência gerada, "
+                        "como entrada compacta para o otimizador."
+                    ),
+                )
+
+                file_base = st.text_input(
+                    "Nome do arquivo",
+                    value="Modelo_solar_1",
+                    key="export_file_name",
+                    help="A extensão .csv é adicionada automaticamente.",
+                )
+                final_filename = normalize_csv_filename(file_base)
+
+                if not selected_columns:
+                    st.warning("Selecione pelo menos uma coluna para habilitar o download.")
+                else:
+                    export_df = build_export_dataframe(
+                        export_window,
+                        selected_labels=selected_columns,
+                        dt_hours=dt_full_h,
+                    )
+                    csv_bytes = export_df.to_csv(
+                        index=False,
+                        float_format="%.6f",
+                    ).encode("utf-8")
+
+                    e1, e2, e3 = st.columns(3)
+                    e1.metric("Arquivo", final_filename)
+                    e2.metric("Linhas", f"{len(export_df):,}")
+                    e3.metric("Colunas", f"{len(export_df.columns)}")
+
+                    with st.expander("Pré-visualizar exatamente o CSV que será baixado", expanded=True):
+                        st.dataframe(export_df, width="stretch", height=360)
+
+                    st.download_button(
+                        "⬇️ Baixar CSV para o otimizador",
+                        data=csv_bytes,
+                        file_name=final_filename,
+                        mime="text/csv",
+                        type="primary",
+                        width="stretch",
+                    )
 
 
 # ===========================================================================
