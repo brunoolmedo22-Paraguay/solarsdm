@@ -1,0 +1,10 @@
+SUBSTITUIR ESTES ARQUIVOS NO REPOSITÓRIO, PRESERVANDO AS PASTAS:
+
+app.py
+models/irradiance_model.py
+simulation/energy.py
+simulation/mpp.py
+visualization/plots.py
+
+Os cinco arquivos formam uma versão sincronizada. Não substitua somente app.py.
+Faça commit de todos na mesma atualização e depois reinicie o app no Streamlit Cloud.
