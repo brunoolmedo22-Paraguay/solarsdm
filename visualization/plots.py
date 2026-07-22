@@ -46,7 +46,7 @@ def plot_irradiance(df: pd.DataFrame) -> go.Figure:
         line=dict(color=C["irradiance"], width=1.6),
         fill="tozeroy", fillcolor="rgba(242,166,90,0.15)",
     ))
-    return _base_layout(fig, "Irradiancia en el plano del módulo", "Hora", "G [W/m²]")
+    return _base_layout(fig, "Irradiancia en el plano del módulo", "Fecha y hora", "G [W/m²]")
 
 
 # ===========================================================================
@@ -63,7 +63,7 @@ def plot_temperatures(df: pd.DataFrame) -> go.Figure:
             x=df.index, y=df["Tc"], name="T célula (NOCT)",
             line=dict(color=C["t_cell"], width=1.8),
         ))
-    return _base_layout(fig, "Temperatura ambiente y de célula", "Hora", "T [°C]")
+    return _base_layout(fig, "Temperatura ambiente y de célula", "Fecha y hora", "T [°C]")
 
 
 # ===========================================================================
@@ -147,7 +147,7 @@ def plot_power(df: pd.DataFrame, show_linear_ref: bool = False) -> go.Figure:
         height=400, margin=dict(l=60, r=60, t=50, b=45), hovermode="x unified",
         legend=dict(orientation="h", y=1.06, x=1, xanchor="right", yanchor="bottom"),
     )
-    fig.update_xaxes(title_text="Hora", gridcolor=C["grid"])
+    fig.update_xaxes(title_text="Fecha y hora", gridcolor=C["grid"])
     fig.update_yaxes(title_text="P salida [W]", secondary_y=False,
                      gridcolor=C["grid"], rangemode="tozero")
     fig.update_yaxes(title_text="P solar incidente [W]", secondary_y=True,
@@ -168,7 +168,7 @@ def plot_efficiency(df: pd.DataFrame, eta_stc: float) -> go.Figure:
     fig.add_hline(y=eta_stc * 100.0, line=dict(color=C["neutral"], dash="dash", width=1.2),
                   annotation_text=f"η STC = {eta_stc*100:.2f} %",
                   annotation_position="bottom right")
-    fig = _base_layout(fig, "Eficiencia instantánea de conversión", "Hora", "η [%]")
+    fig = _base_layout(fig, "Eficiencia instantánea de conversión", "Fecha y hora", "η [%]")
     fig.update_yaxes(rangemode="tozero")
     return fig
 
@@ -177,19 +177,20 @@ def plot_efficiency(df: pd.DataFrame, eta_stc: float) -> go.Figure:
 # 8) Energía acumulada + energía horaria
 # ===========================================================================
 def plot_energy(df: pd.DataFrame, dt_hours: float) -> go.Figure:
-    e_cum = np.cumsum(df["P_array"].to_numpy() * dt_hours) / 1000.0
-    e_hour = (df["P_array"] * dt_hours / 1000.0).groupby(df.index.hour).sum()
+    """Energía por hora cronológica y energía acumulada para uno o varios días."""
+    energy_step = df["P_array"].astype(float) * float(dt_hours) / 1000.0
+    e_hour = energy_step.resample("1h").sum()
+    e_cum = energy_step.cumsum()
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(
-        x=[f"{h:02d}h" for h in e_hour.index], y=e_hour.values,
-        name="Energía horaria", marker_color=C["power_alt"], opacity=0.85,
+        x=e_hour.index, y=e_hour.values,
+        name="Energía por hora", marker_color=C["power_alt"], opacity=0.85,
     ), secondary_y=False)
     fig.add_trace(go.Scatter(
-        x=[f"{h:02d}h" for h in df.index.hour.unique()],
-        y=[e_cum[df.index.hour == h][-1] for h in df.index.hour.unique()],
-        name="Energía acumulada", mode="lines+markers",
-        line=dict(color=C["energy"], width=2.2), marker=dict(size=5),
+        x=df.index, y=e_cum.values,
+        name="Energía acumulada", mode="lines",
+        line=dict(color=C["energy"], width=2.2),
     ), secondary_y=True)
 
     fig.update_layout(
@@ -198,9 +199,63 @@ def plot_energy(df: pd.DataFrame, dt_hours: float) -> go.Figure:
         height=400, margin=dict(l=60, r=60, t=50, b=45), hovermode="x unified",
         legend=dict(orientation="h", y=1.06, x=1, xanchor="right", yanchor="bottom"),
     )
-    fig.update_xaxes(title_text="Hora del día", gridcolor=C["grid"])
-    fig.update_yaxes(title_text="E horaria [kWh]", secondary_y=False, gridcolor=C["grid"])
+    fig.update_xaxes(title_text="Fecha y hora", gridcolor=C["grid"])
+    fig.update_yaxes(title_text="E por hora [kWh]", secondary_y=False, gridcolor=C["grid"])
     fig.update_yaxes(title_text="E acumulada [kWh]", secondary_y=True, showgrid=False)
+    return fig
+
+
+# ===========================================================================
+# Cobertura temporal del CSV
+# ===========================================================================
+def plot_profile_coverage(df: pd.DataFrame) -> go.Figure:
+    """
+    Mapa fecha × hora que distingue datos originales, noche completada y
+    lagunas diurnas completadas. La figura hace explícito qué valores no
+    proceden directamente del CSV.
+    """
+    if "fill_type" not in df.columns:
+        fig = go.Figure()
+        fig.add_annotation(text="Este perfil no contiene información de cobertura.",
+                           x=0.5, y=0.5, showarrow=False)
+        return _base_layout(fig, "Cobertura temporal del perfil", "Hora", "Fecha", height=260)
+
+    status_map = {
+        "original": 0,
+        "sintético": 0,
+        "preenchido_noite": 1,
+        "preenchido_lacuna_diurna": 2,
+    }
+    tmp = pd.DataFrame(index=df.index)
+    tmp["date"] = tmp.index.strftime("%Y-%m-%d")
+    tmp["minute"] = tmp.index.hour * 60 + tmp.index.minute
+    tmp["status"] = df["fill_type"].map(status_map).fillna(0).astype(int).to_numpy()
+    pivot = tmp.pivot_table(index="date", columns="minute", values="status", aggfunc="max")
+
+    colorscale = [
+        [0.000, "#2E7D6B"], [0.333, "#2E7D6B"],
+        [0.334, "#E6E9EE"], [0.666, "#E6E9EE"],
+        [0.667, "#E05C5C"], [1.000, "#E05C5C"],
+    ]
+    x_hours = pivot.columns.to_numpy(dtype=float) / 60.0
+    fig = go.Figure(go.Heatmap(
+        z=pivot.to_numpy(), x=x_hours, y=pivot.index.tolist(),
+        zmin=0, zmax=2, colorscale=colorscale,
+        colorbar=dict(
+            title="Origem", tickvals=[0, 1, 2],
+            ticktext=["CSV", "Noite preenchida", "Lacuna diurna"],
+            thickness=14,
+        ),
+        hovertemplate="Data: %{y}<br>Hora: %{x:.2f} h<br>Código: %{z}<extra></extra>",
+    ))
+    fig.update_layout(
+        template=TPL,
+        title=dict(text="Cobertura temporal e intervalos preenchidos", x=0.01, font=dict(size=15)),
+        height=max(300, min(720, 180 + 4 * len(pivot))),
+        margin=dict(l=80, r=150, t=50, b=45),
+    )
+    fig.update_xaxes(title_text="Hora do dia", range=[0, 24], dtick=2, gridcolor=C["grid"])
+    fig.update_yaxes(title_text="Data", autorange="reversed", gridcolor=C["grid"])
     return fig
 
 
@@ -221,7 +276,7 @@ def plot_mpp_trajectory(df: pd.DataFrame) -> go.Figure:
                        "G = %{customdata[0]:.0f} W/m²<br>"
                        "Pmp = %{customdata[1]:.1f} W<extra></extra>"),
     ))
-    return _base_layout(fig, "Trayectoria del MPP durante el día",
+    return _base_layout(fig, "Trayectoria del MPP durante el período",
                         "Vmp [V]", "Imp [A]", height=420)
 
 

@@ -1,19 +1,15 @@
 """
 simulation/energy.py
 ====================
-Integración energética e indicadores técnicos (KPIs) del sistema PV.
+Integración energética e indicadores técnicos (KPIs) del sistema PV para
+perfiles de uno o varios días.
 
-Definiciones utilizadas (IEC 61724 / práctica de ingeniería):
-
-    E_day   [kWh]      = Σ P(t) * Δt / 1000                (integración rectangular)
-    H_sol   [kWh/m2]   = Σ G(t) * Δt / 1000                (irradiación en el plano)
-    PSH     [h]        = H_sol / 1 kW/m2                   ("horas sol pico")
-
-    Yield específico  Y_f [kWh/kWp] = E_day / P_nom[kW]
-    Performance Ratio PR  [-]       = Y_f / PSH
-    Factor de capacidad  CF [-]     = E_day / (P_nom[kW] * 24 h)
-    Horas equivalentes   [h]        = E_day / P_nom[kW]  ( == Y_f numéricamente)
-    Eficiencia media (ponderada por energía) = E_day / (H_sol * Área)
+Definiciones principales:
+    E_periodo [kWh] = Σ P(t) · Δt / 1000
+    H_periodo [kWh/m²] = Σ G(t) · Δt / 1000
+    Yield específico [kWh/kWp] = E_periodo / P_nom[kWp]
+    PR [-] = Yield específico / H_periodo
+    CF [-] = E_periodo / (P_nom[kW] · duración[h])
 """
 
 from __future__ import annotations
@@ -21,23 +17,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from config.settings import G_REF
 from models.irradiance_model import infer_timestep_hours
 
 
 def integrate_energy(power_w: pd.Series, dt_hours: float) -> np.ndarray:
-    """Energía acumulada [kWh] a lo largo del día (serie acumulada)."""
+    """Energía acumulada [kWh] a lo largo del período."""
     return np.cumsum(power_w.to_numpy(dtype=float) * dt_hours) / 1000.0
 
 
 def compute_kpis(results: pd.DataFrame, module, dt_hours: float | None = None) -> dict:
-    """
-    Calcula todos los KPIs a partir del DataFrame devuelto por simulate_timeseries.
-
-    Returns
-    -------
-    dict con las claves usadas por la interfaz (unidades explícitas).
-    """
+    """Calcula KPIs consistentes para un período arbitrario de simulación."""
     stc = module.stc
     dt = infer_timestep_hours(results) if dt_hours is None else float(dt_hours)
 
@@ -47,47 +36,55 @@ def compute_kpis(results: pd.DataFrame, module, dt_hours: float | None = None) -
     p_nom_kw = results.attrs.get("p_nom_array_W", stc.p_nom * n_mod) / 1000.0
     area = results.attrs.get("area_array_m2", stc.area * n_mod)
 
-    p = results["P_array"].to_numpy(dtype=float)          # [W]
-    g = results["G"].to_numpy(dtype=float)                # [W/m2]
+    p = results["P_array"].to_numpy(dtype=float)
+    g = results["G"].to_numpy(dtype=float)
+    duration_h = float(len(results) * dt)
+    duration_days = duration_h / 24.0 if duration_h > 0 else 0.0
 
-    # --- Energía ----------------------------------------------------------
-    e_day_kwh = float(np.sum(p) * dt / 1000.0)            # [kWh]
-    h_sol = float(np.sum(g) * dt / 1000.0)                # [kWh/m2] == PSH [h]
+    # Energía e irradiación del período completo
+    e_period_kwh = float(np.sum(p) * dt / 1000.0)
+    h_period = float(np.sum(g) * dt / 1000.0)
+    e_day_avg = e_period_kwh / duration_days if duration_days > 0 else 0.0
+    h_day_avg = h_period / duration_days if duration_days > 0 else 0.0
 
-    # --- Potencias --------------------------------------------------------
+    # Potencias
     p_max = float(np.max(p)) if len(p) else 0.0
     i_max = int(np.argmax(p)) if len(p) else 0
     t_peak = results.index[i_max] if len(p) else None
     p_mean = float(np.mean(p)) if len(p) else 0.0
-    # Potencia media en horas de sol (G > 0)
     sun = g > 0
     p_mean_sun = float(np.mean(p[sun])) if sun.any() else 0.0
 
-    # --- Indicadores normalizados ----------------------------------------
-    yf = e_day_kwh / p_nom_kw if p_nom_kw > 0 else 0.0               # [kWh/kWp]
-    pr = yf / h_sol if h_sol > 0 else 0.0                            # [-]
-    cf = e_day_kwh / (p_nom_kw * 24.0) if p_nom_kw > 0 else 0.0      # [-]
-    heq = yf                                                          # [h]
+    # Indicadores normalizados
+    yf = e_period_kwh / p_nom_kw if p_nom_kw > 0 else 0.0
+    pr = yf / h_period if h_period > 0 else 0.0
+    cf = e_period_kwh / (p_nom_kw * duration_h) if p_nom_kw > 0 and duration_h > 0 else 0.0
+    heq = yf
 
-    # --- Eficiencia -------------------------------------------------------
-    e_solar_kwh = h_sol * area                    # energía solar incidente [kWh]
-    eta_mean = e_day_kwh / e_solar_kwh if e_solar_kwh > 0 else 0.0
+    # Eficiencia
+    e_solar_kwh = h_period * area
+    eta_mean = e_period_kwh / e_solar_kwh if e_solar_kwh > 0 else 0.0
     eta_inst = results["eta"].to_numpy(dtype=float)
     eta_max = float(np.max(eta_inst)) if len(eta_inst) else 0.0
 
-    # --- Térmicos / eléctricos --------------------------------------------
+    # Térmicos / eléctricos
     tc = results["Tc"].to_numpy(dtype=float)
     tc_max = float(np.max(tc)) if len(tc) else 0.0
     tc_mean_sun = float(np.mean(tc[sun])) if sun.any() else 0.0
-
-    # Pérdida térmica: energía perdida vs. operar todo el día a 25 °C
-    # (referencia física, no una aproximación del modelo)
     e_lineal_kwh = float(np.sum(results["P_lineal_ref"].to_numpy()) * dt / 1000.0)
 
     return {
-        "E_day_kWh": e_day_kwh,
-        "H_sol_kWh_m2": h_sol,
-        "PSH_h": h_sol,
+        # Nuevas claves explícitas
+        "E_period_kWh": e_period_kwh,
+        "E_day_avg_kWh": e_day_avg,
+        "H_period_kWh_m2": h_period,
+        "H_day_avg_kWh_m2": h_day_avg,
+        "duration_h": duration_h,
+        "duration_days": duration_days,
+        # Compatibilidad con versiones anteriores: ahora representan período
+        "E_day_kWh": e_period_kwh,
+        "H_sol_kWh_m2": h_period,
+        "PSH_h": h_period,
         "specific_yield_kWh_kWp": yf,
         "PR": pr,
         "CF": cf,
@@ -114,8 +111,8 @@ def compute_kpis(results: pd.DataFrame, module, dt_hours: float | None = None) -
 
 
 def energy_by_hour(results: pd.DataFrame, dt_hours: float) -> pd.DataFrame:
-    """Energía producida agregada por hora [kWh] (para el gráfico de barras)."""
+    """Energía producida agregada por hora cronológica [kWh]."""
     e = results["P_array"] * dt_hours / 1000.0
-    by_hour = e.groupby(results.index.hour).sum()
-    by_hour.index.name = "hora"
+    by_hour = e.resample("1h").sum()
+    by_hour.index.name = "timestamp"
     return by_hour.rename("E_kWh").to_frame()

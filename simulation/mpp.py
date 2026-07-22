@@ -161,6 +161,16 @@ def simulate_timeseries(
     out.insert(2, "Tamb", t_amb)
     out.insert(3, "Tc", t_cell)
 
+    # Mantener la trazabilidad del CSV preparado. Estas columnas no participan
+    # de la física, pero permiten identificar qué filas fueron originales y
+    # cuáles fueron completadas por la plataforma.
+    for trace_col in (
+        "is_original", "is_filled", "fill_type",
+        "is_expected_daylight", "Tamb_filled",
+    ):
+        if trace_col in profile.columns:
+            out[trace_col] = profile[trace_col].to_numpy()
+
     # Eficiencia instantánea de conversión del módulo (área bruta)
     denom = out["G_eff"].to_numpy() * stc.area
     with np.errstate(divide="ignore", invalid="ignore"):

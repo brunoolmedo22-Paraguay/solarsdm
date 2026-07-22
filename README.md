@@ -108,6 +108,7 @@ suficiente (todas las dependencias son *wheels* puras).
 ### Validación
 ```bash
 python -m tests.validate
+python -m unittest tests.test_profile_loader -v
 ```
 
 ---
@@ -121,7 +122,7 @@ PV_Simulator/
 │   ├── single_diode.py          # Ecuación del SDM + solvers (LambertW/Brent/Newton)
 │   ├── pv_module.py             # Dataclasses: ModuleSTC, SDMParams, SDMOperating, PVModule
 │   ├── temperature_model.py     # Tc = f(Tamb, G): NOCT y Sandia
-│   └── irradiance_model.py      # Perfiles sintéticos + carga/validación de CSV
+│   └── irradiance_model.py      # Perfiles sintéticos + detección/completado de CSV
 ├── config/
 │   ├── settings.py              # Constantes físicas, STC, bounds, estilo. CERO magic numbers.
 │   └── pv_database.py           # Base de módulos (5 × Canadian Solar poly)
@@ -133,6 +134,7 @@ PV_Simulator/
 │   └── plots.py                 # Plotly (tema claro). Sin cálculo físico.
 ├── data/custom_profiles/        # CSV de ejemplo (1 min)
 ├── tests/validate.py            # Validación física y numérica
+├── tests/test_profile_loader.py # Pruebas del cargador y completado temporal
 ├── requirements.txt
 └── README.md
 ```
@@ -167,22 +169,49 @@ automáticamente. Todo es editable desde la pestaña 1.
 | Pestaña | Contenido |
 |---|---|
 | **1 · Configuración del panel** | Selector fabricante/modelo (+ *Personalizado*). Parámetros eléctricos STC y coeficientes de temperatura editables. Botón de estimación de los 5 parámetros SDM, residuos del ajuste, y verificación catálogo-vs-modelo con la curva I-V/P-V en STC. |
-| **2 · Irradiancia y temperatura** | **Modo A:** carga de CSV `timestamp,G,Tamb` (1 min) con plantilla descargable. **Modo B:** generador de perfiles sintéticos (día soleado / nublado / lluvioso × verano / invierno / otoño-primavera), amanecer, atardecer, G pico, T mín/máx y semilla. Modelo térmico con NOCT editable. |
+| **2 · Irradiancia y temperatura** | **Modo A:** carga de CSV con detección de `Timestamp`, `G`, `GHI_REAL`, `GHI_PREDITO` y temperatura. Permite elegir la serie de GHI, completar las noches con `G=0`, identificar lagunas diurnas, generar temperatura día/noche o por curva estándar y filtrar gráficos por día o intervalo. **Modo B:** generador de perfiles sintéticos. |
 | **3 · Modelo y simulación** | Resumen del módulo, de los parámetros SDM y de las condiciones. Configuración del generador (serie × paralelo, suciedad). Botón **SIMULAR** con barra de progreso. |
 | **4 · Resultados** | KPIs + 8 gráficos + curvas I-V/P-V en el instante seleccionado + familias de curvas paramétricas + trayectoria del MPP + exportación a CSV. |
+
+
+### CSV de previsão (Vitor → modelo solar)
+
+O carregador aceita cabeçalhos flexíveis. Para o fluxo atual do projeto, um arquivo como o abaixo é reconhecido automaticamente:
+
+```csv
+Timestamp,GHI_REAL,GHI_PREDITO
+2016-09-01 06:45:00,4.14,7.58
+2016-09-01 06:46:00,4.98,7.77
+```
+
+Quando existem `GHI_REAL` e `GHI_PREDITO`, a interface seleciona `GHI_PREDITO` por padrão, mas permite trocar a coluna. Se não houver temperatura, a interface oferece:
+
+1. temperatura constante de dia e de noite; ou
+2. curva térmica padrão com temperatura mínima e máxima.
+
+Ao completar o eixo temporal, a plataforma adiciona as colunas de rastreabilidade:
+
+| Coluna | Significado |
+|---|---|
+| `is_original` | registro existente no CSV recebido |
+| `is_filled` | registro criado pela plataforma |
+| `fill_type` | `original`, `preenchido_noite` ou `preenchido_lacuna_diurna` |
+| `Tamb_filled` | temperatura gerada ou interpolada pela plataforma |
+
+As lacunas diurnas também recebem `G=0`, mas são destacadas em vermelho no mapa de cobertura para não serem confundidas com noite.
 
 ### KPIs calculados
 
 | KPI | Definición | Unidad |
 |---|---|---|
-| Energía diaria | `Σ P(t)·Δt / 1000` | kWh |
-| Yield específico `Yf` | `E_día / Pnom[kW]` | kWh/kWp |
-| Performance Ratio `PR` | `Yf / PSH`, con `PSH = Σ G·Δt / 1000` | – |
-| Factor de capacidad `CF` | `E_día / (Pnom[kW] · 24 h)` | – |
-| Horas equivalentes | `E_día / Pnom[kW]` | h |
-| Potencia máxima + horario del pico | `max P(t)` | W, hh:mm |
-| Eficiencia promedio | `E_día / (PSH · Área)` (ponderada por energía) | – |
-| Potencia media | `mean P(t)` (día completo y horas de sol) | W |
+| Energía no período | `Σ P(t)·Δt / 1000` | kWh |
+| Média diária | `E_período / duração[dias]` | kWh/dia |
+| Yield específico `Yf` | `E_período / Pnom[kW]` | kWh/kWp |
+| Performance Ratio `PR` | `Yf / H_período`, com `H = Σ G·Δt / 1000` | – |
+| Fator de capacidade `CF` | `E_período / (Pnom[kW] · duração[h])` | – |
+| Potência máxima + instante do pico | `max P(t)` | W, data-hora |
+| Eficiência média | `E_período / (H_período · Área)` | – |
+| Potência média | `mean P(t)` | W |
 
 ---
 

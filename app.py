@@ -31,8 +31,10 @@ from models.irradiance_model import (
     IRRADIANCE_PROFILES,
     SEASONS,
     build_synthetic_profile,
+    detect_profile_columns,
     infer_timestep_hours,
-    load_custom_profile,
+    prepare_custom_profile,
+    read_custom_profile_table,
 )
 from models.pv_module import PVModule, SDMParams
 from models.single_diode import iv_curve
@@ -48,6 +50,7 @@ from visualization.plots import (
     plot_iv_pv,
     plot_mpp_trajectory,
     plot_power,
+    plot_profile_coverage,
     plot_temperatures,
 )
 
@@ -92,6 +95,8 @@ def init_state():
     ss.setdefault("extraction", None)      # ExtractionReport
     ss.setdefault("profile", None)         # DataFrame [G, Tamb]
     ss.setdefault("profile_desc", "—")
+    ss.setdefault("profile_meta", None)
+    ss.setdefault("uploaded_profile_name", None)
     ss.setdefault("results", None)         # DataFrame simulado
     ss.setdefault("kpis", None)
     ss.setdefault("noct", THERMAL["default_noct"])
@@ -107,6 +112,45 @@ def cached_extraction(stc_dict: dict):
     stc = ModuleSTC(**stc_dict)
     sdm, report = extract_sdm_params(stc)
     return sdm.to_dict(), report
+
+
+def select_date_window(df: pd.DataFrame, key_prefix: str) -> tuple[pd.DataFrame, str]:
+    """Selector reutilizable para mostrar un día o un intervalo de fechas."""
+    if df is None or df.empty:
+        return df, "—"
+
+    min_date = df.index.min().date()
+    max_date = df.index.max().date()
+    if min_date == max_date:
+        return df, min_date.isoformat()
+
+    mode = st.radio(
+        "Período mostrado", ["Um dia", "Intervalo de dias"],
+        horizontal=True, key=f"{key_prefix}_mode",
+    )
+    if mode == "Um dia":
+        selected = st.date_input(
+            "Dia", value=min_date, min_value=min_date, max_value=max_date,
+            key=f"{key_prefix}_day",
+        )
+        start = pd.Timestamp(selected)
+        end = start + pd.Timedelta(days=1)
+        label = selected.isoformat()
+    else:
+        selected = st.date_input(
+            "Intervalo", value=(min_date, max_date),
+            min_value=min_date, max_value=max_date, key=f"{key_prefix}_range",
+        )
+        if isinstance(selected, (tuple, list)) and len(selected) == 2:
+            start = pd.Timestamp(selected[0])
+            end = pd.Timestamp(selected[1]) + pd.Timedelta(days=1)
+        else:
+            start = pd.Timestamp(min_date)
+            end = pd.Timestamp(max_date) + pd.Timedelta(days=1)
+        label = f"{start.date().isoformat()} a {(end - pd.Timedelta(days=1)).date().isoformat()}"
+
+    view = df.loc[(df.index >= start) & (df.index < end)].copy()
+    return view, label
 
 
 # ===========================================================================
@@ -294,68 +338,189 @@ with tab1:
 # TAB 2 — IRRADIANCIA Y TEMPERATURA
 # ===========================================================================
 with tab2:
-    st.subheader("Perfil de irradiancia y temperatura")
+    st.subheader("Perfil de irradiância e temperatura")
 
     mode = st.radio(
         "Modo",
-        ["MODO B · Generador de perfiles característicos", "MODO A · Carga personalizada (CSV)"],
+        ["MODO B · Gerador de perfis característicos", "MODO A · Carregamento personalizado (CSV)"],
         horizontal=True,
     )
 
     # ------------------------- MODO A -------------------------------------
     if mode.startswith("MODO A"):
         st.markdown(
-            '<div class="caption-box">Formato esperado: <code>timestamp,G,Tamb</code> · '
-            "resolución recomendada 1 minuto · timestamp como <code>HH:MM</code> o fecha-hora "
-            "completa. G en W/m², Tamb en °C.</div>",
+            '<div class="caption-box">O carregador reconhece nomes como '
+            '<code>Timestamp</code>, <code>G</code>, <code>GHI_REAL</code>, '
+            '<code>GHI_PREDITO</code> e colunas de temperatura. A série escolhida '
+            'é convertida internamente para <code>G</code> [W/m²]. Os intervalos '
+            'ausentes podem ser completados com G = 0 e ficam identificados.</div>',
             unsafe_allow_html=True,
         )
         st.write("")
 
         cA, cB = st.columns([2, 1])
         with cA:
-            up = st.file_uploader("Archivo CSV", type=["csv"])
+            up = st.file_uploader("Arquivo CSV", type=["csv"], key="profile_csv")
         with cB:
             template = pd.DataFrame({
-                "timestamp": ["00:00", "06:00", "12:00", "18:00", "23:59"],
-                "G": [0, 120, 950, 90, 0],
-                "Tamb": [20.0, 22.0, 32.0, 26.0, 21.0],
+                "Timestamp": ["2026-01-01 06:00:00", "2026-01-01 12:00:00", "2026-01-01 18:00:00"],
+                "GHI_PREDITO": [0.0, 950.0, 0.0],
+                "Temperatura_C": [22.0, 31.0, 26.0],
             })
             st.download_button(
-                "⬇️ Plantilla CSV",
+                "⬇️ Modelo de CSV",
                 template.to_csv(index=False).encode("utf-8"),
-                file_name="plantilla_perfil.csv",
+                file_name="modelo_perfil_previsao.csv",
                 mime="text/csv",
                 width="stretch",
             )
 
         if up is not None:
+            if st.session_state["uploaded_profile_name"] != up.name:
+                st.session_state["uploaded_profile_name"] = up.name
+                st.session_state["profile"] = None
+                st.session_state["profile_meta"] = None
+                st.session_state["results"] = None
+
             try:
-                df = load_custom_profile(up)
-                st.session_state["profile"] = df
-                st.session_state["profile_desc"] = f"CSV · {up.name} · {len(df)} registros"
-                st.success(f"Perfil cargado: {len(df)} registros "
-                           f"(Δt ≈ {infer_timestep_hours(df)*60:.1f} min)")
+                raw = read_custom_profile_table(up)
+                detected = detect_profile_columns(raw.columns)
+
+                st.caption(
+                    f"Arquivo detectado: **{len(raw):,} linhas** · "
+                    f"{len(raw.columns)} colunas · {', '.join(map(str, raw.columns))}"
+                )
+
+                col1, col2, col3 = st.columns(3)
+                columns = list(raw.columns)
+                with col1:
+                    ts_default = columns.index(detected["timestamp_default"]) if detected["timestamp_default"] in columns else 0
+                    timestamp_col = st.selectbox(
+                        "Coluna de timestamp", columns, index=ts_default,
+                        key="csv_timestamp_col",
+                    )
+                with col2:
+                    irr_options = detected["irradiance_candidates"] or columns
+                    irr_default = detected["irradiance_default"]
+                    irr_idx = irr_options.index(irr_default) if irr_default in irr_options else 0
+                    irradiance_col = st.selectbox(
+                        "Coluna de irradiância usada pelo modelo", irr_options, index=irr_idx,
+                        help="Quando existem GHI_REAL e GHI_PREDITO, a previsão é selecionada por padrão.",
+                        key="csv_irradiance_col",
+                    )
+                with col3:
+                    none_temp = "— Temperatura não especificada —"
+                    temp_options = [none_temp] + columns
+                    temp_default = detected["temperature_default"]
+                    temp_idx = temp_options.index(temp_default) if temp_default in temp_options else 0
+                    temp_selection = st.selectbox(
+                        "Coluna de temperatura ambiente", temp_options, index=temp_idx,
+                        key="csv_temperature_col",
+                    )
+                    temperature_col = None if temp_selection == none_temp else temp_selection
+
+                complete_days = st.checkbox(
+                    "Completar todos os dias entre 00:00 e 23:59 com G = 0 nas lacunas",
+                    value=True,
+                    help=(
+                        "A plataforma preserva uma coluna de rastreabilidade. Lacunas fora da "
+                        "janela solar são marcadas como noite preenchida; lacunas dentro da "
+                        "janela solar são destacadas separadamente para revisão."
+                    ),
+                )
+
+                temp_strategy = "constant_day_night"
+                temp_day, temp_night = 30.0, 20.0
+                season = "Otoño/Primavera"
+                t_min_v = t_max_v = None
+
+                if temperature_col is None:
+                    st.warning(
+                        "Temperatura não especificada no CSV. Escolha como a temperatura ambiente "
+                        "será gerada para a simulação."
+                    )
+                    temp_mode = st.radio(
+                        "Temperatura ambiente",
+                        ["Definir temperatura de dia e de noite", "Usar curva de temperatura padrão"],
+                        horizontal=True,
+                        key="csv_temp_mode",
+                    )
+                    if temp_mode.startswith("Definir"):
+                        t1, t2 = st.columns(2)
+                        with t1:
+                            temp_day = st.number_input(
+                                "Temperatura durante o dia [°C]", -30.0, 60.0, 30.0, 0.5,
+                                key="csv_temp_day",
+                            )
+                        with t2:
+                            temp_night = st.number_input(
+                                "Temperatura durante a noite [°C]", -30.0, 60.0, 20.0, 0.5,
+                                key="csv_temp_night",
+                            )
+                        temp_strategy = "constant_day_night"
+                    else:
+                        temp_strategy = "standard_curve"
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            season = st.selectbox("Curva padrão", SEASONS, index=2, key="csv_temp_season")
+                        cfg = PROFILES["seasons"][season]
+                        with c2:
+                            t_min_v = st.number_input(
+                                "Temperatura mínima [°C]", -30.0, 50.0,
+                                float(cfg["t_min"]), 0.5, key="csv_temp_min",
+                            )
+                        with c3:
+                            t_max_v = st.number_input(
+                                "Temperatura máxima [°C]", -20.0, 60.0,
+                                float(cfg["t_max"]), 0.5, key="csv_temp_max",
+                            )
+
+                if st.button("✅ Processar CSV", type="primary", width="stretch"):
+                    with st.spinner("Reconstruindo o eixo temporal e validando os dados…"):
+                        df, meta = prepare_custom_profile(
+                            raw,
+                            timestamp_col=timestamp_col,
+                            irradiance_col=irradiance_col,
+                            temperature_col=temperature_col,
+                            complete_days=complete_days,
+                            temperature_strategy=temp_strategy,
+                            temp_day=float(temp_day),
+                            temp_night=float(temp_night),
+                            season=season,
+                            t_min=t_min_v,
+                            t_max=t_max_v,
+                        )
+                    st.session_state["profile"] = df
+                    st.session_state["profile_meta"] = meta
+                    st.session_state["profile_desc"] = (
+                        f"CSV · {up.name} · G = {irradiance_col} · "
+                        f"{meta['total_rows']} registros · Δt = {meta['timestep_minutes']:.1f} min"
+                    )
+                    st.session_state["results"] = None
+                    st.success(
+                        f"Perfil preparado: {meta['original_rows']:,} registros do CSV + "
+                        f"{meta['filled_rows']:,} registros preenchidos."
+                    )
             except Exception as exc:
-                st.error(f"Error al leer el CSV: {exc}")
+                st.error(f"Erro ao ler ou processar o CSV: {exc}")
 
     # ------------------------- MODO B -------------------------------------
     else:
         g1, g2, g3 = st.columns(3)
         with g1:
-            prof = st.selectbox("Perfil de irradiancia", IRRADIANCE_PROFILES)
+            prof = st.selectbox("Perfil de irradiância", IRRADIANCE_PROFILES)
         with g2:
-            season = st.selectbox("Estación (temperatura)", SEASONS)
+            season = st.selectbox("Estação (temperatura)", SEASONS)
         with g3:
-            dt_min = st.select_slider("Paso temporal [min]", [1, 5, 10, 15, 30, 60], value=1)
+            dt_min = st.select_slider("Passo temporal [min]", [1, 5, 10, 15, 30, 60], value=1)
 
-        with st.expander("Ajustes finos del perfil"):
+        with st.expander("Ajustes finos do perfil"):
             f1, f2, f3, f4 = st.columns(4)
             with f1:
-                sunrise = st.number_input("Amanecer [h]", 3.0, 9.0,
+                sunrise = st.number_input("Amanhecer [h]", 3.0, 9.0,
                                           float(PROFILES["sunrise_h"]), 0.25)
             with f2:
-                sunset = st.number_input("Atardecer [h]", 15.0, 22.0,
+                sunset = st.number_input("Pôr do sol [h]", 15.0, 22.0,
                                          float(PROFILES["sunset_h"]), 0.25)
             with f3:
                 cfg = PROFILES["seasons"][season]
@@ -363,19 +528,20 @@ with tab2:
             with f4:
                 t_max_v = st.number_input("T máx [°C]", -10.0, 55.0, float(cfg["t_max"]), 0.5)
 
-            g_peak = st.slider("Irradiancia pico [W/m²]", 100, 1200,
+            g_peak = st.slider("Irradiância de pico [W/m²]", 100, 1200,
                                int({"Día soleado": PROFILES["g_peak_clear"],
                                     "Día nublado": PROFILES["g_peak_cloudy"],
                                     "Día lluvioso": PROFILES["g_peak_rainy"]}[prof]), 10)
-            seed = st.number_input("Semilla aleatoria", 0, 9999, int(PROFILES["seed"]), 1)
+            seed = st.number_input("Semente aleatória", 0, 9999, int(PROFILES["seed"]), 1)
 
-        if st.button("🔄 Generar perfil", type="primary"):
+        if st.button("🔄 Gerar perfil", type="primary"):
             df = build_synthetic_profile(
                 prof, season, timestep_min=int(dt_min),
                 sunrise=sunrise, sunset=sunset, g_peak=float(g_peak),
                 t_min=t_min_v, t_max=t_max_v, seed=int(seed),
             )
             st.session_state["profile"] = df
+            st.session_state["profile_meta"] = None
             st.session_state["profile_desc"] = (
                 f"{prof} · {season} · Δt = {dt_min} min · Gpico = {g_peak} W/m²"
             )
@@ -388,34 +554,62 @@ with tab2:
     with th1:
         noct_ui = st.number_input(
             "NOCT [°C]", 30.0, 60.0, float(st.session_state["noct"]), 0.5,
-            help="Nominal Operating Cell Temperature (ensayo: 800 W/m², 20 °C, 1 m/s).",
+            help="Nominal Operating Cell Temperature (ensaio: 800 W/m², 20 °C, 1 m/s).",
         )
         st.session_state["noct"] = noct_ui
     with th2:
         st.latex(r"T_c = T_{amb} + \frac{NOCT - 20}{800}\, G")
         st.caption(
-            f"Pendiente actual: {(noct_ui-20)/800:.5f} °C por W/m²  →  "
-            f"a 1000 W/m² la célula está {((noct_ui-20)/800)*1000:.1f} °C por encima del ambiente."
+            f"Inclinação atual: {(noct_ui-20)/800:.5f} °C por W/m²  →  "
+            f"a 1000 W/m² a célula fica {((noct_ui-20)/800)*1000:.1f} °C acima do ambiente."
         )
 
-    # ------------------------- Vista previa -------------------------------
+    # ------------------------- Vista prévia -------------------------------
     df = st.session_state["profile"]
     if df is not None:
         df = df.copy()
         df["Tc"] = cell_temperature_noct(df["Tamb"].to_numpy(), df["G"].to_numpy(), noct_ui)
         st.session_state["profile"] = df
 
-        p1, p2, p3, p4 = st.columns(4)
-        dt_h = infer_timestep_hours(df)
-        p1.metric("G máxima", f"{df['G'].max():.0f} W/m²")
-        p2.metric("Irradiación diaria", f"{df['G'].sum()*dt_h/1000:.2f} kWh/m²")
-        p3.metric("T amb. máxima", f"{df['Tamb'].max():.1f} °C")
-        p4.metric("T célula máxima", f"{df['Tc'].max():.1f} °C")
+        meta = st.session_state.get("profile_meta")
+        if meta is not None:
+            st.divider()
+            st.subheader("Rastreabilidade do preenchimento")
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Registros originais", f"{meta['original_rows']:,}")
+            q2.metric("Noite preenchida", f"{meta['filled_night_rows']:,}")
+            q3.metric("Lacunas diurnas", f"{meta['filled_day_gap_rows']:,}")
+            q4.metric("Total após completar", f"{meta['total_rows']:,}")
+            st.caption(
+                f"Temperatura: {meta['temperature_source']} · "
+                f"Período: {meta['start']} até {meta['end']}"
+            )
+            if meta["filled_day_gap_rows"] > 0:
+                st.warning(
+                    f"Foram encontrados {meta['filled_day_gap_rows']:,} timestamps ausentes dentro "
+                    "da janela solar estimada. Eles foram preenchidos com G = 0, mas aparecem em "
+                    "vermelho no mapa para não serem confundidos com noite."
+                )
+            st.plotly_chart(plot_profile_coverage(df), width="stretch", key="chart_profile_coverage")
 
-        st.plotly_chart(plot_irradiance(df), width="stretch", key="chart_irr_preview")
-        st.plotly_chart(plot_temperatures(df), width="stretch", key="chart_temp_preview")
+        st.divider()
+        st.subheader("Visualização do período")
+        df_view, period_label = select_date_window(df, "profile_preview")
+        if df_view.empty:
+            st.warning("O intervalo selecionado não contém dados.")
+        else:
+            p1, p2, p3, p4 = st.columns(4)
+            dt_h = infer_timestep_hours(df_view)
+            p1.metric("G máxima", f"{df_view['G'].max():.0f} W/m²")
+            p2.metric("Irradiação no período", f"{df_view['G'].sum()*dt_h/1000:.2f} kWh/m²")
+            p3.metric("T amb. máxima", f"{df_view['Tamb'].max():.1f} °C")
+            p4.metric("T célula máxima", f"{df_view['Tc'].max():.1f} °C")
+            st.caption(f"Período exibido: {period_label} · {len(df_view):,} registros")
+
+            st.plotly_chart(plot_irradiance(df_view), width="stretch", key="chart_irr_preview")
+            st.plotly_chart(plot_temperatures(df_view), width="stretch", key="chart_temp_preview")
     else:
-        st.info("Generá un perfil sintético o cargá un CSV para continuar.")
+        st.info("Gere um perfil sintético ou carregue e processe um CSV para continuar.")
 
 
 # ===========================================================================
@@ -527,173 +721,196 @@ with tab4:
     res = st.session_state["results"]
     module = st.session_state["module"]
 
-    # kpi se recalcula siempre a partir de `res` (no se reutiliza el dict cacheado
-    # en session_state): así, si el código de compute_kpis cambia entre versiones,
-    # una sesión de navegador ya abierta no se rompe con un KeyError por un dict
-    # de KPIs viejo que no tiene las claves nuevas.
-    kpi = compute_kpis(res, module, infer_timestep_hours(res)) if res is not None else None
-
-    if res is None or kpi is None:
-        st.info("Ejecutá una simulación en la pestaña 3 para ver los resultados.")
+    if res is None or module is None:
+        st.info("Execute uma simulação na aba 3 para visualizar os resultados.")
     else:
-        dt_h = kpi["dt_hours"]
+        st.subheader("Período visualizado")
+        res_view, results_period_label = select_date_window(res, "results_view")
 
-        # ------------------------- KPIs ----------------------------------
-        st.subheader("Indicadores del sistema")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Energía diaria", f"{kpi['E_day_kWh']:.3f} kWh")
-        k2.metric("Yield específico", f"{kpi['specific_yield_kWh_kWp']:.2f} kWh/kWp")
-        k3.metric("Performance Ratio", f"{kpi['PR']:.3f}")
-        k4.metric("Factor de capacidad", f"{kpi['CF']*100:.2f} %")
-
-        k5, k6, k7, k8 = st.columns(4)
-        k5.metric("Potencia máxima", f"{kpi['P_max_W']:.1f} W",
-                  help="Salida en el MPP resuelta con el SDM.")
-        k6.metric("Horario del pico",
-                  kpi["t_peak"].strftime("%H:%M") if kpi["t_peak"] is not None else "—")
-        k7.metric("Eficiencia promedio", f"{kpi['eta_mean']*100:.2f} %",
-                  delta=f"{(kpi['eta_mean']-kpi['eta_stc'])*100:+.2f} pp vs STC")
-        k8.metric("Potencia media (día)", f"{kpi['P_mean_W']:.1f} W")
-
-        k9, k10, k11, k12 = st.columns(4)
-        k9.metric("Horas equivalentes", f"{kpi['equivalent_hours_h']:.2f} h")
-        k10.metric("Irradiación (PSH)", f"{kpi['PSH_h']:.2f} kWh/m²")
-        k11.metric("Energía solar incidente", f"{kpi['E_solar_kWh']:.2f} kWh")
-        k12.metric("Tc máxima", f"{kpi['Tc_max_C']:.1f} °C",
-                   delta=f"{kpi['Tc_mean_sun_C']:.1f} °C media (con sol)")
-
-        n_series_v = kpi.get("n_series", kpi.get("n_modules", 1))
-        n_parallel_v = kpi.get("n_parallel", 1)
-        area_mod_v = kpi.get("area_module_m2", module.stc.area)
-
-        k13, k14, k15, k16 = st.columns(4)
-        k13.metric("Configuración del array",
-                    f"{n_series_v} serie × {n_parallel_v} paralelo",
-                    help="Definida en la pestaña 3 · Simulación.")
-        k14.metric("Módulos totales", f"{kpi['n_modules']}")
-        k15.metric("Potencia nominal del array", f"{kpi['p_nom_kWp']*1000:.0f} Wp",
-                    help=f"{kpi['n_modules']} × {module.stc.p_nom:.0f} Wp (1 módulo)")
-        k16.metric("Área total del array", f"{kpi['area_m2']:.2f} m²",
-                    help=f"{kpi['n_modules']} × {area_mod_v:.3f} m² (1 módulo: "
-                         f"{module.stc.length:.3f} × {module.stc.width:.3f} m)")
-
-        st.divider()
-
-        # ------------------------- Series temporales ----------------------
-        st.subheader("Series temporales")
-        st.plotly_chart(plot_irradiance(res), width="stretch", key="chart_irr_results")
-        st.plotly_chart(plot_temperatures(res), width="stretch", key="chart_temp_results")
-
-        show_ref = st.checkbox(
-            "Superponer la referencia lineal P = Pnom·G/1000 (solo comparación)", value=False,
-            help="El simulador NO usa esta expresión. Se muestra únicamente para "
-                 "cuantificar el error de esa aproximación frente al SDM.",
-        )
-        st.plotly_chart(plot_power(res, show_linear_ref=show_ref), width="stretch", key="chart_power")
-
-        if show_ref:
-            err = (kpi["E_lineal_ref_kWh"] - kpi["E_day_kWh"]) / kpi["E_day_kWh"] * 100
+        if res_view.empty:
+            st.warning("O intervalo selecionado não contém resultados.")
+        else:
+            kpi = compute_kpis(res_view, module, infer_timestep_hours(res_view))
+            kpi_full = compute_kpis(res, module, infer_timestep_hours(res))
+            dt_h = kpi["dt_hours"]
             st.caption(
-                f"La aproximación lineal predice {kpi['E_lineal_ref_kWh']:.3f} kWh frente a los "
-                f"{kpi['E_day_kWh']:.3f} kWh del SDM → sobrestima la energía en **{err:+.1f} %** "
-                "(ignora el derating térmico y las pérdidas resistivas)."
+                f"Indicadores e gráficos calculados para **{results_period_label}** · "
+                f"{len(res_view):,} passos · {kpi['duration_h']:.1f} h"
             )
 
-        st.plotly_chart(plot_efficiency(res, module.stc.efficiency_stc), width="stretch", key="chart_efficiency")
-        st.plotly_chart(plot_energy(res, dt_h), width="stretch", key="chart_energy")
+            # ------------------------- KPIs ----------------------------------
+            st.subheader("Indicadores do sistema")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Energia no período", f"{kpi['E_period_kWh']:.3f} kWh")
+            k2.metric("Média diária", f"{kpi['E_day_avg_kWh']:.3f} kWh/dia")
+            k3.metric("Performance Ratio", f"{kpi['PR']:.3f}")
+            k4.metric("Fator de capacidade", f"{kpi['CF']*100:.2f} %")
 
-        st.divider()
-
-        # ------------------------- Curvas I-V / P-V -----------------------
-        st.subheader("Curvas I-V y P-V en condiciones seleccionadas")
-
-        cv1, cv2, cv3 = st.columns([1, 1, 1.2])
-        with cv1:
-            hours = sorted(res.index.strftime("%H:%M").tolist())
-            default_i = int(res["Pmp"].to_numpy().argmax())
-            sel = st.select_slider(
-                "Instante del día", options=hours,
-                value=res.index[default_i].strftime("%H:%M"),
+            k5, k6, k7, k8 = st.columns(4)
+            k5.metric("Potência máxima", f"{kpi['P_max_W']:.1f} W",
+                      help="Saída no MPP resolvida pelo SDM.")
+            k6.metric(
+                "Instante do pico",
+                kpi["t_peak"].strftime("%Y-%m-%d %H:%M") if kpi["t_peak"] is not None else "—",
             )
-        row = res[res.index.strftime("%H:%M") == sel].iloc[0]
-        with cv2:
-            st.metric("G / Tc en el instante", f"{row['G']:.0f} W/m²  ·  {row['Tc']:.1f} °C")
-        with cv3:
-            st.metric("MPP resuelto",
-                      f"{row['Pmp']:.1f} W  ·  {row['Vmp']:.1f} V  ·  {row['Imp']:.2f} A")
+            k7.metric("Eficiência média", f"{kpi['eta_mean']*100:.2f} %",
+                      delta=f"{(kpi['eta_mean']-kpi['eta_stc'])*100:+.2f} pp vs STC")
+            k8.metric("Potência média", f"{kpi['P_mean_W']:.1f} W")
 
-        curves = []
-        if row["G"] > SOLVER["g_min"]:
-            p_op = translate_params(module.sdm, module.stc, row["G_eff"], row["Tc"])
-            V, I, P = iv_curve(p_op)
+            k9, k10, k11, k12 = st.columns(4)
+            k9.metric("Yield específico", f"{kpi['specific_yield_kWh_kWp']:.2f} kWh/kWp")
+            k10.metric("Irradiação no período", f"{kpi['H_period_kWh_m2']:.2f} kWh/m²")
+            k11.metric("Energia solar incidente", f"{kpi['E_solar_kWh']:.2f} kWh")
+            k12.metric("Tc máxima", f"{kpi['Tc_max_C']:.1f} °C",
+                       delta=f"{kpi['Tc_mean_sun_C']:.1f} °C média com sol")
+
+            n_series_v = kpi.get("n_series", kpi.get("n_modules", 1))
+            n_parallel_v = kpi.get("n_parallel", 1)
+            area_mod_v = kpi.get("area_module_m2", module.stc.area)
+
+            k13, k14, k15, k16 = st.columns(4)
+            k13.metric("Configuração do array", f"{n_series_v} série × {n_parallel_v} paralelo")
+            k14.metric("Módulos totais", f"{kpi['n_modules']}")
+            k15.metric("Potência nominal", f"{kpi['p_nom_kWp']*1000:.0f} Wp")
+            k16.metric("Área total", f"{kpi['area_m2']:.2f} m²",
+                       help=f"{kpi['n_modules']} × {area_mod_v:.3f} m² por módulo")
+
+            st.divider()
+
+            # ------------------------- Séries temporais ----------------------
+            st.subheader("Séries temporais")
+            st.plotly_chart(plot_irradiance(res_view), width="stretch", key="chart_irr_results")
+            st.plotly_chart(plot_temperatures(res_view), width="stretch", key="chart_temp_results")
+
+            show_ref = st.checkbox(
+                "Sobrepor referência linear P = Pnom·G/1000 (somente comparação)", value=False,
+                help="O simulador não usa esta expressão; ela aparece apenas como referência.",
+            )
+            st.plotly_chart(
+                plot_power(res_view, show_linear_ref=show_ref),
+                width="stretch", key="chart_power",
+            )
+
+            if show_ref and kpi["E_period_kWh"] > 0:
+                err = (kpi["E_lineal_ref_kWh"] - kpi["E_period_kWh"]) / kpi["E_period_kWh"] * 100
+                st.caption(
+                    f"A aproximação linear prevê {kpi['E_lineal_ref_kWh']:.3f} kWh frente a "
+                    f"{kpi['E_period_kWh']:.3f} kWh do SDM: diferença de **{err:+.1f} %**."
+                )
+
+            st.plotly_chart(
+                plot_efficiency(res_view, module.stc.efficiency_stc),
+                width="stretch", key="chart_efficiency",
+            )
+            st.plotly_chart(plot_energy(res_view, dt_h), width="stretch", key="chart_energy")
+
+            st.divider()
+
+            # ------------------------- Curvas I-V / P-V -----------------------
+            st.subheader("Curvas I-V e P-V nas condições selecionadas")
+
+            peak_ts = kpi["t_peak"] if kpi["t_peak"] is not None else res_view.index[0]
+            available_dates = sorted(set(res_view.index.date))
+            default_date_index = available_dates.index(peak_ts.date()) if peak_ts.date() in available_dates else 0
+
+            cv1, cv2, cv3 = st.columns([1, 1, 1.2])
+            with cv1:
+                curve_date = st.selectbox(
+                    "Data", available_dates, index=default_date_index,
+                    format_func=lambda d: d.isoformat(), key="curve_date",
+                )
+                day_rows = res_view[res_view.index.date == curve_date]
+                time_labels = day_rows.index.strftime("%H:%M:%S").tolist()
+                peak_label = peak_ts.strftime("%H:%M:%S") if peak_ts.date() == curve_date else time_labels[0]
+                if peak_label not in time_labels:
+                    peak_label = time_labels[0]
+                sel_time = st.select_slider(
+                    "Horário", options=time_labels, value=peak_label, key="curve_time",
+                )
+
+            selected_ts = day_rows.index[day_rows.index.strftime("%H:%M:%S") == sel_time][0]
+            row = day_rows.loc[selected_ts]
+            with cv2:
+                st.metric("G / Tc", f"{row['G']:.0f} W/m² · {row['Tc']:.1f} °C")
+            with cv3:
+                st.metric(
+                    "MPP resolvido",
+                    f"{row['Pmp']:.1f} W · {row['Vmp']:.1f} V · {row['Imp']:.2f} A",
+                )
+
+            curves = []
+            if row["G"] > SOLVER["g_min"]:
+                p_op = translate_params(module.sdm, module.stc, row["G_eff"], row["Tc"])
+                V, I, P = iv_curve(p_op)
+                curves.append({
+                    "label": f"{selected_ts:%Y-%m-%d %H:%M} · {row['G']:.0f} W/m², {row['Tc']:.0f} °C",
+                    "V": V, "I": I, "P": P,
+                    "mpp": {"Vmp": row["Vmp"], "Imp": row["Imp"], "Pmp": row["Pmp"]},
+                })
+            p_stc = translate_params(module.sdm, module.stc, G_REF, T_REF_C)
+            Vs, Is, Ps = iv_curve(p_stc)
             curves.append({
-                "label": f"{sel} · {row['G']:.0f} W/m², {row['Tc']:.0f} °C",
-                "V": V, "I": I, "P": P,
-                "mpp": {"Vmp": row["Vmp"], "Imp": row["Imp"], "Pmp": row["Pmp"]},
+                "label": "STC (referência)", "V": Vs, "I": Is, "P": Ps,
+                "mpp": find_mpp(p_stc), "color": "#9AA5B1",
             })
-        p_stc = translate_params(module.sdm, module.stc, G_REF, T_REF_C)
-        Vs, Is, Ps = iv_curve(p_stc)
-        curves.append({"label": "STC (referencia)", "V": Vs, "I": Is, "P": Ps,
-                       "mpp": find_mpp(p_stc), "color": "#9AA5B1"})
+            st.plotly_chart(plot_iv_pv(curves), width="stretch", key="chart_iv_pv_instant")
 
-        st.plotly_chart(plot_iv_pv(curves), width="stretch", key="chart_iv_pv_instant")
+            with st.expander("Famílias de curvas I-V (validação física do modelo)"):
+                fam1, fam2 = st.columns(2)
+                with fam1:
+                    fam_g = {}
+                    for g in (200, 400, 600, 800, 1000):
+                        p = translate_params(module.sdm, module.stc, g, 25.0)
+                        V, I, _ = iv_curve(p, n_points=200)
+                        fam_g[f"{g} W/m²"] = {"V": V, "I": I, "mpp": find_mpp(p)}
+                    st.plotly_chart(
+                        plot_iv_family(fam_g, "Tensão V [V]",
+                                       "Efeito da irradiância (Tc = 25 °C)"),
+                        width="stretch", key="chart_family_irr",
+                    )
+                with fam2:
+                    fam_t = {}
+                    for t in (15, 25, 45, 65):
+                        p = translate_params(module.sdm, module.stc, G_REF, float(t))
+                        V, I, _ = iv_curve(p, n_points=200)
+                        fam_t[f"{t} °C"] = {"V": V, "I": I, "mpp": find_mpp(p)}
+                    st.plotly_chart(
+                        plot_iv_family(fam_t, "Tensão V [V]",
+                                       "Efeito da temperatura (G = 1000 W/m²)"),
+                        width="stretch", key="chart_family_temp",
+                    )
 
-        # --- Familias de curvas (validación física visual) -----------------
-        with st.expander("Familias de curvas I-V (validación física del modelo)"):
-            fam1, fam2 = st.columns(2)
-            with fam1:
-                fam_g = {}
-                for g in (200, 400, 600, 800, 1000):
-                    p = translate_params(module.sdm, module.stc, g, 25.0)
-                    V, I, _ = iv_curve(p, n_points=200)
-                    fam_g[f"{g} W/m²"] = {"V": V, "I": I, "mpp": find_mpp(p)}
-                st.plotly_chart(
-                    plot_iv_family(fam_g, "Tensión V [V]",
-                                   "Efecto de la irradiancia (Tc = 25 °C) — la corriente escala con G"),
+            st.plotly_chart(plot_mpp_trajectory(res_view), width="stretch", key="chart_mpp_traj")
+
+            st.divider()
+
+            # ------------------------- Downloads ------------------------------
+            st.subheader("Exportação")
+            st.caption("Os arquivos abaixo correspondem à simulação completa, não apenas ao recorte exibido.")
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    "⬇️ Série temporal simulada (CSV)",
+                    res.to_csv().encode("utf-8"),
+                    file_name="pv_simulacao_series.csv",
+                    mime="text/csv",
                     width="stretch",
-                    key="chart_family_irr",
                 )
-            with fam2:
-                fam_t = {}
-                for t in (15, 25, 45, 65):
-                    p = translate_params(module.sdm, module.stc, G_REF, float(t))
-                    V, I, _ = iv_curve(p, n_points=200)
-                    fam_t[f"{t} °C"] = {"V": V, "I": I, "mpp": find_mpp(p)}
-                st.plotly_chart(
-                    plot_iv_family(fam_t, "Tensión V [V]",
-                                   "Efecto de la temperatura (G = 1000 W/m²) — Voc cae con Tc"),
+            with d2:
+                kpi_out = {
+                    k: (v.strftime("%Y-%m-%d %H:%M") if hasattr(v, "strftime") else v)
+                    for k, v in kpi_full.items()
+                }
+                st.download_button(
+                    "⬇️ KPIs da simulação completa (CSV)",
+                    pd.Series(kpi_out, name="valor").to_csv().encode("utf-8"),
+                    file_name="pv_simulacao_kpis.csv",
+                    mime="text/csv",
                     width="stretch",
-                    key="chart_family_temp",
                 )
 
-        st.plotly_chart(plot_mpp_trajectory(res), width="stretch", key="chart_mpp_traj")
-
-        st.divider()
-
-        # ------------------------- Descargas ------------------------------
-        st.subheader("Exportación")
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "⬇️ Serie temporal simulada (CSV)",
-                res.to_csv().encode("utf-8"),
-                file_name="pv_simulacion_series.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-        with d2:
-            kpi_out = {k: (v.strftime("%H:%M") if hasattr(v, "strftime") else v)
-                       for k, v in kpi.items()}
-            st.download_button(
-                "⬇️ KPIs (CSV)",
-                pd.Series(kpi_out, name="valor").to_csv().encode("utf-8"),
-                file_name="pv_simulacion_kpis.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-
-        with st.expander("Tabla de resultados (primeras 200 filas)"):
-            st.dataframe(res.head(200), width="stretch")
+            with st.expander("Tabela de resultados do intervalo exibido (primeiras 200 linhas)"):
+                st.dataframe(res_view.head(200), width="stretch")
 
 
 # ===========================================================================
