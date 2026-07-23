@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import io
+from pathlib import Path
 from dataclasses import replace
 
 import numpy as np
@@ -76,6 +77,14 @@ read_custom_profile_table = _irradiance_model.read_custom_profile_table
 from models.pv_module import PVModule, SDMParams
 from models.single_diode import iv_curve
 from models.temperature_model import cell_temperature_noct
+from simulation.automation import (
+    AUTOMATION_INPUT_FILENAMES,
+    AUTOMATION_N_PARALLEL,
+    AUTOMATION_N_SERIES,
+    build_configuration_report,
+    build_results_zip,
+    run_all_automation_cases,
+)
 from simulation.energy import compute_kpis
 from simulation.export import (
     DEFAULT_EXPORT_COLUMNS,
@@ -144,6 +153,10 @@ def init_state():
     ss.setdefault("results", None)         # DataFrame simulado
     ss.setdefault("kpis", None)
     ss.setdefault("noct", THERMAL["default_noct"])
+    ss.setdefault("automation_cases", None)
+    ss.setdefault("automation_module", None)
+    ss.setdefault("automation_report", None)
+    ss.setdefault("automation_zip", None)
 
 
 init_state()
@@ -206,12 +219,13 @@ st.caption(
     "completa del circuito equivalente de un diodo. Sin aproximaciones lineales de potencia."
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1 · Configuración del panel",
     "2 · Irradiancia y temperatura",
     "3 · Modelo y simulación",
     "4 · Resultados",
     "5 · Exportar resultados",
+    "6 · Automação",
 ])
 
 
@@ -1124,6 +1138,135 @@ with tab5:
                         type="primary",
                         width="stretch",
                     )
+
+
+# ===========================================================================
+# TAB 6 — AUTOMAÇÃO
+# ===========================================================================
+with tab6:
+    st.subheader("Automação — previsão meteorológica → potência fotovoltaica")
+    st.markdown(
+        '<div class="caption-box"><b>Rotina fechada e sem configurações.</b> '
+        'Ao executar, a plataforma lê os quatro CSVs da pasta '
+        '<code>Dados_exemplo/</code>, aplica o módulo Canadian Solar '
+        '<b>CS7L-580MS</b> com parâmetros SDM fixos e um arranjo de '
+        f'<b>{AUTOMATION_N_SERIES} módulos em série × {AUTOMATION_N_PARALLEL} strings em paralelo</b>. '
+        'Cada janela é simulada somente dentro dos 120 timestamps fornecidos.</div>',
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    if st.button(
+        "⚡ EXECUTAR AUTOMAÇÃO SOLAR",
+        type="primary",
+        width="stretch",
+        key="run_solar_automation",
+    ):
+        data_dir = Path(__file__).resolve().parent / "Dados_exemplo"
+        try:
+            with st.spinner("Lendo previsões e resolvendo o SDM para as quatro janelas…"):
+                automation_module, automation_cases = run_all_automation_cases(data_dir)
+                automation_report = build_configuration_report(automation_module)
+                automation_zip = build_results_zip(automation_cases)
+        except Exception as exc:
+            st.session_state["automation_cases"] = None
+            st.session_state["automation_module"] = None
+            st.session_state["automation_report"] = None
+            st.session_state["automation_zip"] = None
+            st.error(f"Não foi possível executar a automação: {exc}")
+        else:
+            st.session_state["automation_cases"] = automation_cases
+            st.session_state["automation_module"] = automation_module
+            st.session_state["automation_report"] = automation_report
+            st.session_state["automation_zip"] = automation_zip
+            st.success(
+                f"Automação concluída: {len(automation_cases)} previsões convertidas "
+                "em potência fotovoltaica."
+            )
+
+    automation_cases = st.session_state.get("automation_cases")
+    automation_module = st.session_state.get("automation_module")
+    automation_report = st.session_state.get("automation_report")
+    automation_zip = st.session_state.get("automation_zip")
+
+    if automation_cases:
+        summary_rows = []
+        for case in automation_cases:
+            summary_rows.append({
+                "Entrada": case.input_filename,
+                "Janela": f"{case.start:%H:%M}–{case.end:%H:%M}",
+                "Linhas": len(case.export_df),
+                "Potência máxima [W]": case.kpis["P_max_W"],
+                "Energia [kWh]": case.kpis["E_period_kWh"],
+                "Saída": case.output_filename,
+            })
+
+        st.subheader("Resultados gerados")
+        st.dataframe(
+            pd.DataFrame(summary_rows).style.format({
+                "Potência máxima [W]": "{:.2f}",
+                "Energia [kWh]": "{:.4f}",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "Cada arquivo possui exatamente 120 linhas e somente as colunas "
+            "`timestamp` e `potencia_gerada_W`."
+        )
+
+        if automation_zip is not None:
+            st.download_button(
+                "⬇️ Baixar todos os resultados (.zip)",
+                data=automation_zip,
+                file_name="Modelos_solares_automatizados.zip",
+                mime="application/zip",
+                type="primary",
+                width="stretch",
+                key="download_automation_zip",
+            )
+
+        cols = st.columns(len(automation_cases))
+        for col, case in zip(cols, automation_cases):
+            with col:
+                st.download_button(
+                    f"⬇️ {case.output_filename}",
+                    data=case.csv_bytes,
+                    file_name=case.output_filename,
+                    mime="text/csv",
+                    width="stretch",
+                    key=f"download_{case.output_filename}",
+                )
+
+        st.divider()
+        st.subheader("Relatório da configuração fixa")
+        if automation_module is not None:
+            n_modules_auto = AUTOMATION_N_SERIES * AUTOMATION_N_PARALLEL
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Módulo", "CS7L-580MS")
+            r2.metric("Arranjo", f"{AUTOMATION_N_SERIES}S × {AUTOMATION_N_PARALLEL}P")
+            r3.metric("Módulos", str(n_modules_auto))
+            r4.metric(
+                "Potência instalada",
+                f"{automation_module.stc.p_nom*n_modules_auto/1000:.3f} kWp",
+            )
+
+        if automation_report:
+            st.download_button(
+                "⬇️ Baixar relatório de configuração",
+                data=automation_report.encode("utf-8"),
+                file_name="RELATORIO_CONFIGURACAO_AUTOMACAO_SOLAR.md",
+                mime="text/markdown",
+                width="stretch",
+                key="download_automation_report",
+            )
+            with st.expander("Visualizar configuração utilizada"):
+                st.markdown(automation_report)
+    else:
+        st.caption(
+            "Arquivos esperados no repositório: "
+            + ", ".join(f"`{name}`" for name in AUTOMATION_INPUT_FILENAMES)
+        )
 
 
 # ===========================================================================

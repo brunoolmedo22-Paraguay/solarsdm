@@ -256,3 +256,29 @@ Rendimiento: **1440 pasos (1 día a 1 min) en ≈ 0.5 s**.
   cells using Lambert W-function*. Solar Energy Materials & Solar Cells 81(2).
 * King, D.L. et al. (2004). *Photovoltaic Array Performance Model*. Sandia SAND2004-3535.
 * IEC 61724 — *Photovoltaic system performance monitoring*.
+
+
+## Exportação para o otimizador
+
+A aba **5 · Exportar resultados** permite escolher um dia, o horário inicial e
+a duração da janela. O padrão é uma janela de **120 minutos**, com CSV contendo
+somente `timestamp` e `potencia_gerada_W`. As colunas e o nome do arquivo podem
+ser configurados antes do download.
+
+## Automação solar (aba 6)
+
+A aba **6 · Automação** implementa um fluxo fechado para demonstração da
+integração previsão → modelo fotovoltaico → otimizador. Ao clicar em um único
+botão, a aplicação lê os quatro arquivos de `Dados_exemplo/`, aplica o módulo
+Canadian Solar **CS7L-580MS**, parâmetros SDM fixos e o arranjo **3S × 2P**.
+
+A rotina gera quatro arquivos compactos:
+
+- `Modelo_solar_06.csv`
+- `Modelo_solar_12.csv`
+- `Modelo_solar_16.csv`
+- `Modelo_solar_18.csv`
+
+Cada arquivo contém somente `timestamp` e `potencia_gerada_W`, com 120 linhas.
+A própria aba disponibiliza também um relatório Markdown com todos os parâmetros
+do módulo, do SDM e do arranjo.
